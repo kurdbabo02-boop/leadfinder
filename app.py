@@ -4,7 +4,6 @@ import csv
 import re
 import io
 import random
-import threading
 import uuid
 from datetime import datetime
 from urllib.parse import quote_plus
@@ -314,112 +313,6 @@ async def run_scraper(steden: list, categorieen: list, max_per_cat: int, scan_id
     return alle_leads
 
 
-@st.cache_resource
-def scan_store():
-    return {"jobs": {}, "lock": threading.Lock()}
-
-
-def start_scan_job(steden: list, categorieen: list, max_per_cat: int) -> str:
-    store = scan_store()
-    job_id = uuid.uuid4().hex[:10]
-    scan_id = uuid.uuid4().hex[:8]
-    job = {
-        "id": job_id,
-        "scan_id": scan_id,
-        "status": "running",
-        "steden": steden,
-        "categorieen": categorieen,
-        "max_per_cat": max_per_cat,
-        "logs": [f"🚀 Scan gestart met id `{scan_id}`"],
-        "leads": [],
-        "done": 0,
-        "total": max(len(steden) * len(categorieen), 1),
-        "error": "",
-        "started_at": datetime.now(),
-    }
-    with store["lock"]:
-        store["jobs"][job_id] = job
-
-    def log(msg):
-        with store["lock"]:
-            store["jobs"][job_id]["logs"].append(msg)
-
-    def progress(done, total, _n_leads):
-        with store["lock"]:
-            store["jobs"][job_id]["done"] = done
-            store["jobs"][job_id]["total"] = total
-
-    def runner():
-        try:
-            leads = asyncio.run(run_scraper(steden, categorieen, max_per_cat, scan_id, log, progress))
-            with store["lock"]:
-                store["jobs"][job_id]["leads"] = leads
-                store["jobs"][job_id]["status"] = "done"
-                store["jobs"][job_id]["done"] = store["jobs"][job_id]["total"]
-        except Exception as e:
-            with store["lock"]:
-                store["jobs"][job_id]["status"] = "error"
-                store["jobs"][job_id]["error"] = str(e)
-
-    threading.Thread(target=runner, daemon=True).start()
-    return job_id
-
-
-def get_scan_job(job_id: str) -> dict:
-    store = scan_store()
-    with store["lock"]:
-        job = store["jobs"].get(job_id)
-        if not job:
-            return {}
-        return {**job, "logs": list(job["logs"]), "leads": list(job["leads"])}
-
-
-def render_leads(leads: list, stad_label: str, started_at: datetime):
-    st.success(f"**{len(leads)} leads** gevonden zonder eigen website")
-
-    csv_data = naar_csv(leads)
-    ts = started_at.strftime("%Y%m%d_%H%M")
-    st.download_button(
-        "⬇️ Download alle leads als CSV",
-        data=csv_data,
-        file_name=f"leads_{stad_label}_{ts}.csv",
-        mime="text/csv",
-    )
-
-    st.divider()
-
-    for i, l in enumerate(leads, 1):
-        s = l["score"]
-        cls = "score-high" if s >= 60 else "score-mid" if s >= 35 else "score-low"
-
-        c1, c2 = st.columns([4, 1])
-        with c1:
-            badges = ""
-            if l.get("categorie"):
-                badges += f"`{l['categorie']}`  "
-            if l.get("stad"):
-                badges += f"`{l['stad']}`"
-            st.markdown(f"**{i}. {l['naam']}**  {badges}")
-            if l.get("type"):
-                st.caption(l["type"])
-        with c2:
-            st.markdown(f'<span class="{cls}">{s}/100</span>', unsafe_allow_html=True)
-
-        m1, m2, m3 = st.columns(3)
-        m1.metric("📞 Telefoon", l.get("telefoon") or "—")
-        m2.metric("⭐ Rating", f"{l['rating']}/5" if l.get("rating") else "—")
-        m3.metric("💬 Reviews", l.get("reviews", 0))
-
-        if l.get("adres"):
-            st.caption(f"📍 {l['adres']}")
-        if l.get("redenen"):
-            st.caption("  •  ".join(l["redenen"]))
-        if l.get("maps_url"):
-            st.markdown(f"[📍 Open in Google Maps]({l['maps_url']})")
-
-        st.divider()
-
-
 def naar_csv(leads: list) -> str:
     output = io.StringIO()
     velden = ["score", "naam", "categorie", "stad", "type", "telefoon", "adres", "rating", "reviews", "maps_url"]
@@ -502,42 +395,80 @@ if zoek_knop:
         st.error("Vul een bedrijfstype in.")
         st.stop()
 
-    job_id = start_scan_job(steden, categorieen_input, max_per_cat)
-    st.session_state["active_job_id"] = job_id
-    st.session_state["active_stad_label"] = stad_input.strip()
-    st.success("Scan gestart op de achtergrond. Je kunt straks met 'Ververs status' kijken hoe ver hij is.")
-
-active_job_id = st.session_state.get("active_job_id")
-active_job = get_scan_job(active_job_id) if active_job_id else {}
-
-if active_job:
     col_log, col_res = st.columns([1, 2])
-    pct = active_job["done"] / max(active_job["total"], 1)
-    status = active_job["status"]
 
     with col_log:
         st.subheader("📡 Voortgang")
-        st.progress(pct, text=f"{active_job['done']}/{active_job['total']} zoekopdrachten")
-        st.metric("Leads gevonden", len(active_job["leads"]))
-        st.caption(f"Scan id: `{active_job['scan_id']}`")
-        if st.button("🔄 Ververs status"):
-            st.rerun()
-        st.markdown("\n\n".join(active_job["logs"][-14:]))
+        log_box  = st.empty()
+        prog_bar = st.progress(0, text="Bezig...")
+        stat_box = st.empty()
+        log_lines = []
+
+        def log(msg):
+            log_lines.append(msg)
+            log_box.markdown("\n\n".join(log_lines[-14:]))
+
+        def upd(gedaan, totaal, n_leads):
+            pct = gedaan / max(totaal, 1)
+            prog_bar.progress(pct, text=f"{gedaan}/{totaal} zoekopdrachten")
+            stat_box.metric("Leads gevonden", n_leads)
 
     with col_res:
         st.subheader("🎯 Leads")
-        if status == "running":
-            st.info("De scan draait op de achtergrond. Je hoeft dit scherm niet open te houden.")
-        elif status == "error":
-            st.error(f"Scan gestopt: {active_job['error']}")
-        elif not active_job["leads"]:
-            st.warning("Geen leads gevonden. Probeer andere instellingen.")
-        else:
-            render_leads(
-                active_job["leads"],
-                st.session_state.get("active_stad_label", "leads"),
-                active_job["started_at"],
+        res_placeholder = st.empty()
+
+    scan_id = uuid.uuid4().hex[:8]
+    leads = asyncio.run(run_scraper(steden, categorieen_input, max_per_cat, scan_id, log, upd))
+    prog_bar.progress(1.0, text="✅ Klaar!")
+
+    if not leads:
+        res_placeholder.warning("Geen leads gevonden. Probeer andere instellingen.")
+    else:
+        with res_placeholder.container():
+            st.success(f"**{len(leads)} leads** gevonden zonder eigen website")
+
+            csv_data = naar_csv(leads)
+            ts = datetime.now().strftime("%Y%m%d_%H%M")
+            label = stad_input.strip()
+            st.download_button(
+                "⬇️ Download alle leads als CSV",
+                data=csv_data,
+                file_name=f"leads_{label}_{ts}.csv",
+                mime="text/csv",
             )
+
+            st.divider()
+
+            for i, l in enumerate(leads, 1):
+                s = l["score"]
+                cls = "score-high" if s >= 60 else "score-mid" if s >= 35 else "score-low"
+
+                c1, c2 = st.columns([4, 1])
+                with c1:
+                    badges = ""
+                    if l.get("categorie"):
+                        badges += f"`{l['categorie']}`  "
+                    if l.get("stad"):
+                        badges += f"`{l['stad']}`"
+                    st.markdown(f"**{i}. {l['naam']}**  {badges}")
+                    if l.get("type"):
+                        st.caption(l["type"])
+                with c2:
+                    st.markdown(f'<span class="{cls}">{s}/100</span>', unsafe_allow_html=True)
+
+                m1, m2, m3 = st.columns(3)
+                m1.metric("📞 Telefoon", l.get("telefoon") or "—")
+                m2.metric("⭐ Rating", f"{l['rating']}/5" if l.get("rating") else "—")
+                m3.metric("💬 Reviews", l.get("reviews", 0))
+
+                if l.get("adres"):
+                    st.caption(f"📍 {l['adres']}")
+                if l.get("redenen"):
+                    st.caption("  •  ".join(l["redenen"]))
+                if l.get("maps_url"):
+                    st.markdown(f"[📍 Open in Google Maps]({l['maps_url']})")
+
+                st.divider()
 
 else:
     st.info("👈 Kies instellingen links en klik op **Starten**")
