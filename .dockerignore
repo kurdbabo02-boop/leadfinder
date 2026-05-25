@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.venv/
+my-streamlit-app/
+.git/
+.DS_Store
