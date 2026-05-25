@@ -3,7 +3,10 @@ import asyncio
 import csv
 import re
 import io
+import random
+import uuid
 from datetime import datetime
+from urllib.parse import quote_plus
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
 # ── Configuratie ─────────────────────────────────────────────────────────────
@@ -35,7 +38,7 @@ ALLE_CATEGORIEEN = [
     "autorijschool", "sportschool", "fotograaf", "makelaar",
 ]
 
-# Top 30 Nederlandse steden — gebruikt als stad leeg is
+# Populaire steden en wijken. Staat jouw locatie er niet tussen, kies dan zelf typen.
 ALLE_STEDEN = [
     "Amsterdam", "Rotterdam", "Den Haag", "Utrecht", "Eindhoven",
     "Tilburg", "Groningen", "Almere", "Breda", "Nijmegen",
@@ -44,6 +47,20 @@ ALLE_STEDEN = [
     "Delft", "Venlo", "Deventer", "Helmond", "Alkmaar",
     "Leeuwarden", "Zaandam", "Purmerend", "Hoorn", "Gouda",
 ]
+
+POPULAIRE_WIJKEN = [
+    "Amsterdam Centrum", "Amsterdam De Pijp", "Amsterdam Jordaan", "Amsterdam Noord",
+    "Amsterdam Oud-West", "Amsterdam Oost", "Amsterdam West", "Amsterdam Zuid",
+    "Rotterdam Centrum", "Rotterdam Noord", "Rotterdam Kralingen", "Rotterdam Delfshaven",
+    "Rotterdam Feijenoord", "Rotterdam Charlois", "Den Haag Centrum", "Den Haag Scheveningen",
+    "Den Haag Laak", "Den Haag Escamp", "Den Haag Segbroek", "Utrecht Centrum",
+    "Utrecht Lombok", "Utrecht Leidsche Rijn", "Utrecht Overvecht", "Utrecht Kanaleneiland",
+    "Eindhoven Centrum", "Eindhoven Strijp", "Eindhoven Woensel", "Tilburg Centrum",
+    "Groningen Centrum", "Groningen Helpman", "Almere Stad", "Breda Centrum",
+    "Nijmegen Centrum", "Haarlem Centrum", "Arnhem Centrum", "Leiden Centrum",
+]
+
+LOCATIE_KEUZES = ["Kies een stad of wijk...", "✏️ Zelf typen..."] + ALLE_STEDEN + POPULAIRE_WIJKEN
 
 BEDRIJFSTYPEN = [
     "🔀 Alle categorieën (automatisch)",
@@ -98,8 +115,8 @@ def bereken_score(bedrijf: dict) -> tuple:
 
 # ── Scraping ──────────────────────────────────────────────────────────────────
 
-async def verzamel_urls(page, zoekterm: str, max_te_scannen: int) -> list:
-    url = f"https://www.google.com/maps/search/{zoekterm.replace(' ', '+')}"
+async def verzamel_urls(page, zoekterm: str, max_te_scannen: int, scan_id: str) -> list:
+    url = f"https://www.google.com/maps/search/{quote_plus(zoekterm)}?hl=nl&leadfinder_scan={scan_id}"
     await page.goto(url, wait_until="domcontentloaded", timeout=20000)
     await page.wait_for_timeout(2500)
 
@@ -231,7 +248,7 @@ async def check_bedrijf(page, naam: str, info: dict) -> dict:
 
 
 async def scan_combinatie(stad: str, categorie: str, max_per_cat: int,
-                           al_gezien: set, log_fn) -> list:
+                           al_gezien: set, scan_id: str, log_fn) -> list:
     leads = []
     zoekterm = f"{categorie} {stad}"
 
@@ -243,14 +260,15 @@ async def scan_combinatie(stad: str, categorie: str, max_per_cat: int,
         )
         page = await ctx.new_page()
 
-        log_fn(f"🔍 **{categorie}** in **{stad}**...")
+        log_fn(f"🔍 **{categorie}** in **{stad}**... scan `{scan_id}`")
         try:
-            bedrijven = await verzamel_urls(page, zoekterm, max_per_cat)
+            bedrijven = await verzamel_urls(page, zoekterm, max_per_cat, scan_id)
         except Exception as e:
             log_fn(f"  ⚠️ Kon lijst niet laden: {e}")
             await browser.close()
             return leads
 
+        random.SystemRandom().shuffle(bedrijven)
         log_fn(f"  → {len(bedrijven)} gevonden in lijst")
 
         for naam, info in bedrijven:
@@ -277,7 +295,7 @@ async def scan_combinatie(stad: str, categorie: str, max_per_cat: int,
     return leads
 
 
-async def run_scraper(steden: list, categorieen: list, max_per_cat: int, log_fn, progress_fn):
+async def run_scraper(steden: list, categorieen: list, max_per_cat: int, scan_id: str, log_fn, progress_fn):
     al_gezien = set()
     alle_leads = []
     totaal_combinaties = len(steden) * len(categorieen)
@@ -285,7 +303,7 @@ async def run_scraper(steden: list, categorieen: list, max_per_cat: int, log_fn,
 
     for stad in steden:
         for cat in categorieen:
-            leads = await scan_combinatie(stad, cat, max_per_cat, al_gezien, log_fn)
+            leads = await scan_combinatie(stad, cat, max_per_cat, al_gezien, scan_id, log_fn)
             alle_leads.extend(leads)
             gedaan += 1
             progress_fn(gedaan, totaal_combinaties, len(alle_leads))
@@ -324,10 +342,13 @@ st.caption("Bedrijven zonder website opsporen via Google Maps — automatisch ge
 with st.sidebar:
     st.header("⚙️ Instellingen")
 
-    stad_input = st.text_input(
-        "🏙️ Stad of wijk",
-        placeholder="Leeg laten = heel Nederland (30 steden)",
-    )
+    locatie_keuze = st.selectbox("🏙️ Stad of wijk", LOCATIE_KEUZES)
+    if locatie_keuze.startswith("✏️"):
+        stad_input = st.text_input("Typ stad of wijk", placeholder="bijv. Amsterdam De Pijp")
+    elif locatie_keuze.startswith("Kies"):
+        stad_input = ""
+    else:
+        stad_input = locatie_keuze
 
     type_keuze = st.selectbox("🏢 Type bedrijf", BEDRIJFSTYPEN)
     if type_keuze.startswith("✏️"):
@@ -341,11 +362,7 @@ with st.sidebar:
 
     max_per_cat = st.slider("🎯 Max leads per categorie", 5, 40, 15, 5)
 
-    # Bepaal steden
-    if stad_input.strip():
-        steden = [stad_input.strip()]
-    else:
-        steden = ALLE_STEDEN
+    steden = [stad_input.strip()] if stad_input.strip() else []
 
     # Schatting tonen
     n_combis = len(steden) * len(categorieen_input)
@@ -359,7 +376,7 @@ with st.sidebar:
 
     st.divider()
     st.markdown("**💡 Tips:**")
-    st.markdown("- Leeg = heel NL (langzamer)")
+    st.markdown("- Stad of wijk is verplicht")
     st.markdown("- Wijk werkt beter dan grote stad")
     st.markdown("- Kleine steden geven meer leads")
 
@@ -370,6 +387,10 @@ with st.sidebar:
 
 # ── Hoofdpaneel ───────────────────────────────────────────────────────────────
 if zoek_knop:
+    if not steden:
+        st.error("Kies of typ eerst een stad of wijk.")
+        st.stop()
+
     if not categorieen_input:
         st.error("Vul een bedrijfstype in.")
         st.stop()
@@ -396,7 +417,8 @@ if zoek_knop:
         st.subheader("🎯 Leads")
         res_placeholder = st.empty()
 
-    leads = asyncio.run(run_scraper(steden, categorieen_input, max_per_cat, log, upd))
+    scan_id = uuid.uuid4().hex[:8]
+    leads = asyncio.run(run_scraper(steden, categorieen_input, max_per_cat, scan_id, log, upd))
     prog_bar.progress(1.0, text="✅ Klaar!")
 
     if not leads:
@@ -407,7 +429,7 @@ if zoek_knop:
 
             csv_data = naar_csv(leads)
             ts = datetime.now().strftime("%Y%m%d_%H%M")
-            label = stad_input.strip() if stad_input.strip() else "nederland"
+            label = stad_input.strip()
             st.download_button(
                 "⬇️ Download alle leads als CSV",
                 data=csv_data,
@@ -452,7 +474,7 @@ else:
     st.info("👈 Kies instellingen links en klik op **Starten**")
     c1, c2, c3 = st.columns(3)
     with c1:
-        st.markdown("**1. 🔍 Zoeken**\nGoogle Maps wordt doorzocht per stad + categorie. Laat stad leeg voor heel Nederland.")
+        st.markdown("**1. 🔍 Zoeken**\nGoogle Maps wordt doorzocht per gekozen stad of wijk + categorie.")
     with c2:
         st.markdown("**2. 🌐 Filteren**\nBedrijven met eigen website eruit — ook Treatwell, Fresha, sociale media.")
     with c3:
