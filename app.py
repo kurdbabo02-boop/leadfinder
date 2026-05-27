@@ -60,7 +60,23 @@ POPULAIRE_WIJKEN = [
     "Nijmegen Centrum", "Haarlem Centrum", "Arnhem Centrum", "Leiden Centrum",
 ]
 
-LOCATIE_KEUZES = ["Kies een stad of wijk...", "✏️ Zelf typen..."] + ALLE_STEDEN + POPULAIRE_WIJKEN
+BELGIE_STEDEN = [
+    "Brussel, België", "Antwerpen, België", "Gent, België", "Charleroi, België",
+    "Luik, België", "Brugge, België", "Namen, België", "Leuven, België",
+    "Mechelen, België", "Aalst, België", "La Louvière, België", "Kortrijk, België",
+    "Hasselt, België", "Sint-Niklaas, België", "Oostende, België", "Genk, België",
+    "Seraing, België", "Roeselare, België", "Moeskroen, België", "Beveren, België",
+    "Dendermonde, België", "Beringen, België", "Turnhout, België", "Vilvoorde, België",
+    "Lokeren, België",
+]
+
+LOCATIE_KEUZES = [
+    "Kies een stad of wijk...",
+    "🇳🇱 Heel Nederland",
+    "🇧🇪 Heel België",
+    "🇳🇱🇧🇪 Heel Nederland + België",
+    "✏️ Zelf typen...",
+] + ALLE_STEDEN + POPULAIRE_WIJKEN + BELGIE_STEDEN
 
 BEDRIJFSTYPEN = [
     "🔀 Alle categorieën (automatisch)",
@@ -451,6 +467,12 @@ with st.sidebar:
         stad_input = st.text_input("Typ stad of wijk", placeholder="bijv. Amsterdam De Pijp")
     elif locatie_keuze.startswith("Kies"):
         stad_input = ""
+    elif locatie_keuze.startswith("🇳🇱🇧🇪"):
+        stad_input = "Heel Nederland + België"
+    elif locatie_keuze.startswith("🇳🇱"):
+        stad_input = "Heel Nederland"
+    elif locatie_keuze.startswith("🇧🇪"):
+        stad_input = "Heel België"
     else:
         stad_input = locatie_keuze
 
@@ -467,7 +489,14 @@ with st.sidebar:
     max_per_cat = st.slider("🎯 Max leads per categorie", 5, 40, 15, 5)
     zoek_modus = st.selectbox("🎯 Wat wil je vinden?", ZOEK_MODI)
 
-    steden = [stad_input.strip()] if stad_input.strip() else []
+    if stad_input == "Heel Nederland":
+        steden = ALLE_STEDEN
+    elif stad_input == "Heel België":
+        steden = BELGIE_STEDEN
+    elif stad_input == "Heel Nederland + België":
+        steden = ALLE_STEDEN + BELGIE_STEDEN
+    else:
+        steden = [stad_input.strip()] if stad_input.strip() else []
 
     # Schatting tonen
     n_combis = len(steden) * len(categorieen_input)
@@ -482,6 +511,7 @@ with st.sidebar:
     st.divider()
     st.markdown("**💡 Tips:**")
     st.markdown("- Stad of wijk is verplicht")
+    st.markdown("- Heel Nederland/België duurt veel langer")
     st.markdown("- Wijk werkt beter dan grote stad")
     st.markdown("- Kleine steden geven meer leads")
 
