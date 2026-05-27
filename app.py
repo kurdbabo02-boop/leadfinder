@@ -74,6 +74,12 @@ BEDRIJFSTYPEN = [
     "✏️ Zelf invullen...",
 ]
 
+ZOEK_MODI = [
+    "Bedrijven zonder website",
+    "Bedrijven met verouderde website",
+    "Allebei",
+]
+
 # ── Hulpfuncties ──────────────────────────────────────────────────────────────
 
 def is_echte_website(url: str) -> bool:
@@ -110,6 +116,74 @@ def bereken_score(bedrijf: dict) -> tuple:
     for t, s in TYPE_SCORES.items():
         if t in btype or btype in t:
             score += s * 2; redenen.append("🏢 Hoog-potentieel sector"); break
+    return min(score, 100), redenen
+
+
+async def analyseer_verouderde_website(page, website_url: str) -> tuple:
+    redenen = []
+    score = 0
+    if website_url.startswith("http://"):
+        score += 25
+        redenen.append("Geen HTTPS")
+
+    try:
+        await page.goto(website_url, wait_until="domcontentloaded", timeout=10000)
+        await page.wait_for_timeout(1200)
+        analyse = await page.evaluate("""
+            () => {
+                const html = document.documentElement.outerHTML.toLowerCase();
+                const text = document.body ? document.body.innerText : "";
+                const viewport = document.querySelector('meta[name="viewport"]');
+                const tables = document.querySelectorAll('table').length;
+                const frames = document.querySelectorAll('frame, frameset').length;
+                const scripts = Array.from(document.querySelectorAll('script[src]')).map(s => s.src.toLowerCase());
+                const copyright = Array.from(text.matchAll(/(?:©|copyright)\\s*(?:\\d{4}\\s*[-–]\\s*)?(20\\d{2}|19\\d{2})/gi)).map(m => Number(m[1]));
+                return {
+                    hasViewport: !!viewport,
+                    tables,
+                    frames,
+                    textLength: text.length,
+                    oldCopyright: copyright.length ? Math.max(...copyright) : 0,
+                    hasFlash: html.includes('.swf') || html.includes('flash player'),
+                    hasOldJquery: scripts.some(src => /jquery[-.]1\\.|jquery[-.]2\\./.test(src)),
+                    hasUnderConstruction: /under construction|binnenkort online|website in aanbouw|coming soon/i.test(text),
+                    hasOldCms: /joomla! 1\\.|joomla! 2\\.|wordpress 3\\.|wordpress 4\\./i.test(html),
+                };
+            }
+        """)
+        huidig_jaar = datetime.now().year
+        if not analyse.get("hasViewport"):
+            score += 20
+            redenen.append("Geen mobiele viewport")
+        if analyse.get("frames"):
+            score += 25
+            redenen.append("Gebruikt frames")
+        if analyse.get("tables", 0) >= 4:
+            score += 15
+            redenen.append("Veel layout-tabellen")
+        if analyse.get("hasFlash"):
+            score += 30
+            redenen.append("Flash/SWF gevonden")
+        if analyse.get("hasOldJquery"):
+            score += 15
+            redenen.append("Oude jQuery")
+        if analyse.get("hasOldCms"):
+            score += 20
+            redenen.append("Oude CMS-signalen")
+        if analyse.get("hasUnderConstruction"):
+            score += 25
+            redenen.append("In aanbouw/coming soon")
+        copyright_jaar = analyse.get("oldCopyright", 0)
+        if copyright_jaar and copyright_jaar <= huidig_jaar - 4:
+            score += 20
+            redenen.append(f"Copyright uit {copyright_jaar}")
+        if analyse.get("textLength", 0) < 250:
+            score += 10
+            redenen.append("Weinig inhoud")
+    except Exception:
+        score += 10
+        redenen.append("Website traag of lastig te laden")
+
     return min(score, 100), redenen
 
 
@@ -170,11 +244,12 @@ async def verzamel_urls(page, zoekterm: str, max_te_scannen: int, scan_id: str) 
     return list(bedrijven.items())
 
 
-async def check_bedrijf(page, naam: str, info: dict) -> dict:
+async def check_bedrijf(page, naam: str, info: dict, check_verouderd: bool = False) -> dict:
     href = info["href"]
     data = {
         "naam": naam, "website": None, "telefoon": None, "adres": None,
         "rating": info.get("rating_hint", 0.0), "reviews": info.get("reviews_hint", 0),
+        "verouderd_score": 0, "verouderd_redenen": [],
         "type": "", "maps_url": href,
     }
     try:
@@ -214,8 +289,13 @@ async def check_bedrijf(page, naam: str, info: dict) -> dict:
         except Exception:
             pass
 
-        # Stop meteen als website gevonden — scheelt tijd
-        if data["website"]:
+        if data["website"] and check_verouderd:
+            oud_score, oud_redenen = await analyseer_verouderde_website(page, data["website"])
+            data["verouderd_score"] = oud_score
+            data["verouderd_redenen"] = oud_redenen
+
+        # Stop meteen als website gevonden en we niet op verouderde websites controleren.
+        if data["website"] and not check_verouderd:
             return data
 
         # Telefoon
@@ -248,7 +328,7 @@ async def check_bedrijf(page, naam: str, info: dict) -> dict:
 
 
 async def scan_combinatie(stad: str, categorie: str, max_per_cat: int,
-                           al_gezien: set, scan_id: str, log_fn) -> list:
+                           al_gezien: set, scan_id: str, zoek_modus: str, log_fn) -> list:
     leads = []
     zoekterm = f"{categorie} {stad}"
 
@@ -278,15 +358,33 @@ async def scan_combinatie(stad: str, categorie: str, max_per_cat: int,
                 continue
             al_gezien.add(naam)
             try:
-                details = await check_bedrijf(page, naam, info)
-                if details and not details["website"]:
+                check_verouderd = zoek_modus in ("Bedrijven met verouderde website", "Allebei")
+                details = await check_bedrijf(page, naam, info, check_verouderd)
+                is_zonder_website = details and not details["website"]
+                is_verouderd = details and details["website"] and details.get("verouderd_score", 0) >= 35
+
+                if zoek_modus == "Bedrijven zonder website":
+                    lead_match = is_zonder_website
+                elif zoek_modus == "Bedrijven met verouderde website":
+                    lead_match = is_verouderd
+                else:
+                    lead_match = is_zonder_website or is_verouderd
+
+                if lead_match:
                     score, redenen = bereken_score(details)
+                    if is_verouderd:
+                        score = min(100, score + min(details.get("verouderd_score", 0), 40))
+                        redenen = redenen + [f"🕰️ Verouderde website ({details['verouderd_score']}/100)"] + details.get("verouderd_redenen", [])
                     details.update({"score": score, "redenen": redenen,
                                     "categorie": categorie, "stad": stad})
                     leads.append(details)
                     log_fn(f"  ✅ **{naam}** — score {score}")
-                else:
+                elif is_verouderd:
+                    log_fn(f"  ⬜ {naam[:36]} verouderd, maar buiten filter")
+                elif details and details["website"]:
                     log_fn(f"  ⬜ {naam[:36]} heeft website")
+                else:
+                    log_fn(f"  ⬜ {naam[:36]} past niet binnen filter")
             except Exception:
                 log_fn(f"  ⚠️ Fout bij {naam[:30]}")
                 continue
@@ -295,7 +393,7 @@ async def scan_combinatie(stad: str, categorie: str, max_per_cat: int,
     return leads
 
 
-async def run_scraper(steden: list, categorieen: list, max_per_cat: int, scan_id: str, log_fn, progress_fn):
+async def run_scraper(steden: list, categorieen: list, max_per_cat: int, scan_id: str, zoek_modus: str, log_fn, progress_fn):
     al_gezien = set()
     alle_leads = []
     totaal_combinaties = len(steden) * len(categorieen)
@@ -303,7 +401,7 @@ async def run_scraper(steden: list, categorieen: list, max_per_cat: int, scan_id
 
     for stad in steden:
         for cat in categorieen:
-            leads = await scan_combinatie(stad, cat, max_per_cat, al_gezien, scan_id, log_fn)
+            leads = await scan_combinatie(stad, cat, max_per_cat, al_gezien, scan_id, zoek_modus, log_fn)
             alle_leads.extend(leads)
             gedaan += 1
             progress_fn(gedaan, totaal_combinaties, len(alle_leads))
@@ -315,11 +413,17 @@ async def run_scraper(steden: list, categorieen: list, max_per_cat: int, scan_id
 
 def naar_csv(leads: list) -> str:
     output = io.StringIO()
-    velden = ["score", "naam", "categorie", "stad", "type", "telefoon", "adres", "rating", "reviews", "maps_url"]
+    velden = [
+        "score", "naam", "categorie", "stad", "type", "telefoon", "adres",
+        "rating", "reviews", "website", "verouderd_score", "verouderd_redenen", "maps_url"
+    ]
     w = csv.DictWriter(output, fieldnames=velden, extrasaction="ignore")
     w.writeheader()
     for l in leads:
-        w.writerow({k: l.get(k, "") for k in velden})
+        row = {k: l.get(k, "") for k in velden}
+        if isinstance(row.get("verouderd_redenen"), list):
+            row["verouderd_redenen"] = " | ".join(row["verouderd_redenen"])
+        w.writerow(row)
     return output.getvalue()
 
 
@@ -361,6 +465,7 @@ with st.sidebar:
         categorieen_input = [type_keuze.split(" /")[0].replace("✏️", "").strip()]
 
     max_per_cat = st.slider("🎯 Max leads per categorie", 5, 40, 15, 5)
+    zoek_modus = st.selectbox("🎯 Wat wil je vinden?", ZOEK_MODI)
 
     steden = [stad_input.strip()] if stad_input.strip() else []
 
@@ -418,14 +523,14 @@ if zoek_knop:
         res_placeholder = st.empty()
 
     scan_id = uuid.uuid4().hex[:8]
-    leads = asyncio.run(run_scraper(steden, categorieen_input, max_per_cat, scan_id, log, upd))
+    leads = asyncio.run(run_scraper(steden, categorieen_input, max_per_cat, scan_id, zoek_modus, log, upd))
     prog_bar.progress(1.0, text="✅ Klaar!")
 
     if not leads:
         res_placeholder.warning("Geen leads gevonden. Probeer andere instellingen.")
     else:
         with res_placeholder.container():
-            st.success(f"**{len(leads)} leads** gevonden zonder eigen website")
+            st.success(f"**{len(leads)} leads** gevonden")
 
             csv_data = naar_csv(leads)
             ts = datetime.now().strftime("%Y%m%d_%H%M")
@@ -463,6 +568,8 @@ if zoek_knop:
 
                 if l.get("adres"):
                     st.caption(f"📍 {l['adres']}")
+                if l.get("website"):
+                    st.markdown(f"[🌐 Website]({l['website']})")
                 if l.get("redenen"):
                     st.caption("  •  ".join(l["redenen"]))
                 if l.get("maps_url"):
@@ -476,6 +583,6 @@ else:
     with c1:
         st.markdown("**1. 🔍 Zoeken**\nGoogle Maps wordt doorzocht per gekozen stad of wijk + categorie.")
     with c2:
-        st.markdown("**2. 🌐 Filteren**\nBedrijven met eigen website eruit — ook Treatwell, Fresha, sociale media.")
+        st.markdown("**2. 🌐 Filteren**\nVind bedrijven zonder website of met duidelijke verouderingssignalen.")
     with c3:
         st.markdown("**3. 🎯 Scoren**\nElke lead scoort 0–100 op basis van reviews, rating en sector. Download als CSV.")
